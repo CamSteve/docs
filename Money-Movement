@@ -1,0 +1,206 @@
+# DRAFT \- Hudson Money Movement
+
+### **Overview**
+
+Hudson Technology Systems is a money transmitter, not a bank. This is the single most important thing to understand about how money moves here. BetrLink holds a master bank account at Century Next Bank (CNext) and, separately, at Benchmark Bank (BNB). All client funds physically live in those accounts. Hudson’s job is to track, with total accuracy, which dollars belong to which client, which creditor is owed what, and when money crosses the boundary between internal ledger entries and real-world movement.
+
+The system's core purpose is to fulfill these two central responsibilities: moving money correctly on behalf of DSC clients, and proving at the end of every day that the internal ledger matches what the bank says actually happened.
+
+---
+
+### **The Ledger Architecture**
+
+The U.S. financial system is a stack of ledgers. At the top is the Federal Reserve, which maintains the master ledger for every registered bank in the country. When money moves between two banks, the Fed adjusts both banks' balances on that master ledger.
+
+Banks sit one layer below the Fed. They maintain their own internal ledgers for customer accounts, and they are licensed to communicate directly with the Fed to settle transactions.
+
+Hudson sits one layer below Century Next. As a money transmitter, Hudson cannot communicate with the Fed directly. All instructions flow through CNext. Hudson’s account at CNext looks, from CNext's perspective, like a single checking account. CNext does not know about any of Hudson’s internal sub-accounts, it only knows the total balance of that one account.
+
+---
+
+### **Account Types**
+
+All accounts in Hudson are ledger entries. With the exception of the corporate master accounts at CNext and BNB, none of them represent a distinct physical bank account. They are partitions of the corporate master balance, tracked in the Hudson system.
+
+**Corporate Master (`corporate_master`):** The only account tied to real money. There are two: one at Century Next and one at Benchmark Bank. Its ledger balance is negative by convention, representing the total of all funds distributed into sub-accounts. The negative balance is not a deficit, it is a bookkeeping convention that means "this money has been allocated outward." The corporate master balance should always equal the sum of all sub-account balances. At any given time, the system may be tracking hundreds of millions of dollars this way.
+
+**Client Accounts:** One per DSC client. This is where cleared deposits land and from which payments, fees, and withdrawals originate.
+
+**Deposit Hold (`deposit_hold`):** A reconciliation account. When Hudson initiates an ACH debit to pull a deposit from a client's personal bank account, the incoming funds land here first and remain for approximately three business days. This hold period absorbs potential ACH returns before BetrLink credits the client.
+
+**Payment Withdrawal Hold (`payment_withdrawal_hold`):** A reconciliation account. When a creditor payment clears internally, funds move from the client account into this account and wait there until the creditor collects. The money is still Hudson’s responsibility and is no longer the client's, this is the window during which interest can be earned on those funds.
+
+**Fee Accounts:** Internal accounts that accumulate fees charged by BetrLink and by the DSC. There is a separate fee account per entity (e.g., the BetrLink Fee Hold account is distinct from the NDR Fee Hold account). No real money leaves the corporate master when a fee is swept into a fee account.
+
+**Payee Accounts (Direct Pay):** Internal accounts for specific creditors who have opened accounts with BetrLink. Examples include Cavalry, Synchrony, and certain law offices. These work identically to fee accounts from a ledger perspective.
+
+---
+
+### **The Internal Ledger vs. Real-World Money Movement**
+
+This distinction is the foundation of everything else. Transactions in Hudson fall into two categories:
+
+**Internal transactions (TRX):** Move money between sub-accounts without touching the physical bank accounts. Fee swipes, direct pay settlements, and courtesy credits are all internal. No ACH file is generated. No aggregate is created. The corporate master balance does not change because no money has left or entered the physical CNext account. These transactions clear immediately once funds are available.
+
+**External transactions:** Move money to or from the real world: a client's personal bank, a creditor's bank, or the Federal Reserve. These transactions require an ACH file (or check) to be generated, submitted to NACHA via CNext, and confirmed by a BAI file. An aggregate transaction is created in Hudson’s system to represent the expected real-world movement.
+
+A transaction record (TRX) in the Hudson system is an instruction, it tells the system what money should do. The actual movement does not happen until the transaction clears, and for external transactions, "cleared" means an ACH file went out and a BAI file came back confirming it.
+
+---
+
+### **Aggregates and Reconciliation (BAI Files)**
+
+Aggregates are Hudson’s accounting for real-world money movement. Whenever an ACH file is submitted (or a check processed), Hudson creates one or more aggregate transactions representing the total value of that file or batch. Each aggregate is classified as either an aggregate debit (money coming into the corporate master) or an aggregate credit (money leaving the corporate master).
+
+BAI files are daily bank statements. CNext and BNB each generate a BAI file every morning covering all transactions from the prior business day. Each line in a BAI file represents one real-world money movement in or out of the BetrLink corporate account.
+
+Reconciliation is the matching of BAI lines to aggregates, one-to-one. If every aggregate matches a BAI line, the day is clean. A mismatch, a BAI line with no aggregate, or an aggregate with no BAI line, signals that something went wrong. A file may not have been sent, a file may have been sent twice, or a bank-side error occurred. BAI files are never altered, they are the source of truth.
+
+The BAI file covers the following line types:
+
+* **ACHN (ACH In):** Incoming ACH requests, primarily creditor payment collections and REACH funding deposits.  
+* **ACHN Return:** Hudson’s responses to ACHN lines when funds are unavailable.  
+* **ACH Out:** Hudson’s outgoing ACH instructions for client deposits and withdrawals.  
+* **ACH Out Return:** Returns received from the bank when an ACH Out fails (e.g., client's account is closed).  
+* **ACH Return:** A rare "argument" file used when BetrLink disputes a return it received (for example, a duplicate return claim).  
+* **RPSMS In (ARP SMS In):** Checks presented for payment against BetrLink accounts.  
+* **RPSMS Return:** Checks BetrLink returned unpaid.
+
+Each of these line types has a corresponding aggregate type in Hudson, and each aggregate type has a corresponding BAI line. This 1:1 matching is what the morning health check confirms.
+
+---
+
+### **Client Deposits**
+
+A client deposit moves money from the client's personal bank account into their client account. It is the source of nearly every dollar in the system.
+
+**Initiation:** Hudson generates an ACH Out Debit file containing one line per client being drafted that day. This file is submitted to NACHA via CNext. The moment Hudson submits this file, CNext settles the money, the funds move into the corporate master account at CNext immediately. An aggregate debit is created at submission, not at clearing. The deposit transaction itself is created in Hudson’s system and its status is set to Pending with `submitted_to_nacha = true`.
+
+**Hold period:** The funds sit in the `deposit_hold` account for approximately three full business days. This window exists because ACH is a trust-based system: funds settle immediately upon submission, but the originating bank (here, the client's personal bank) has up to 72 business hours to return the transaction. Hudson does not move money into the client's account until it is confident no return is coming.
+
+**Clearing:** On the morning of the next business day after the three-day hold, the clear job moves the funds from `deposit_hold` to the client account. The transaction status changes to Cleared and the `cleared_date` field is populated. A null `cleared_date` on any transaction means the money has not moved.
+
+**Return before clearing (status: Returned):** If Hudson receives an ACH Out Return notice before the deposit clears, for example, an R01 (insufficient funds) or an R02 (account closed), the deposit status is updated to Returned. The funds never reach the client account. No reversal transaction is needed because no internal ledger movement occurred.
+
+**Return after clearing (status: Reversed):** If a return notice arrives after the deposit has already cleared into the client account, Hudson cannot simply undo the original transaction. The system is “go-forward,” meaning marking a transaction Reversed does not move money. A new, separate Deposit Reversal (RD) transaction is automatically created to move the funds back out of the client account and into `deposit_hold`, and then an aggregate credit is created to send the money back out through ACH. The original transaction is marked Reversed; the RD transaction is what actually moves the money.
+
+---
+
+### **Creditor Payments**
+
+Payments from a client to a creditor follow the same general clearing logic, but in reverse, and with an additional matching step.
+
+**Types of payments:** Creditors collect using two methods. In the first (type P6, sometimes called a "phone pay"), Hudson makes funds available to the creditor at the client's account and routing number, and the creditor comes to collect via whichever rail it chooses: ACH or check. Hudson does not initiate any outbound instruction, it is waiting. In the second method, direct pay, the creditor has an account with BetrLink and Hudson handles the transfer entirely internally, with one outbound ACH per day for the creditor's total accumulated funds.
+
+**Clearing (internal):** When a payment clears, funds move from the client's account to the `payment_withdrawal_hold`. This is the `cleared_date` on the payment transaction. From this point, the funds no longer belong to the client.
+
+**Posting (external):** When the creditor collects, either by presenting an ACH debit (an ACHN line) or cashing a check, the funds move from `payment_withdrawal_hold` to the corporate master via an aggregate credit, representing money leaving Hudson. The `posted_date` field is populated at this point.
+
+Clearing and posting can be days or weeks apart. For ACH, the gap is typically 1–3 days. For checks, it can be up to 90 days, matching the "not valid after 90 days" clause printed on most checks. A payment is held in `payment_withdrawal_hold` for the full 90-day window before BetrLink automatically reverses it back to the client.
+
+**ACH In matching:** When an ACHN line arrives, Hudson matches it against cleared payment transactions. The amount, client account number, and routing number must match exactly to a cleared payment. Any ACHN line that cannot be matched within 60 days must either be matched or returned via an ACHN Return file, which Hudson sends by 4 PM daily.
+
+Return codes on ACHN returns follow NACHA's R-code standard. R01 (insufficient funds) must be returned within 3 business days. R10 (unauthorized debit, such as, client dispute) has a 60-day window. At day 59, Hudson auto-returns any undecisioned R10 items.
+
+**Payment reversal (status: Reversed):** If a cleared payment needs to be reversed before the creditor collects it, Hudson creates a Payment Reversal (RP) transaction that moves funds from `payment_withdrawal_hold` back to the client account. If a check was issued, Hudson recognizes the check serial number when it is presented and automatically returns it with a "funds not available" response code.
+
+---
+
+### **Withdrawals**
+
+A client withdrawal moves money from a client's account directly back to their personal bank account. For example, a client exiting the program and requesting their remaining balance.
+
+Withdrawals are cleared before they are submitted to NACHA, in contrast to deposits. Hudson ensures the funds are in the client account before generating the ACH Out Credit file. This prevents returns. The cleared withdrawal moves funds from the client account to `payment_withdrawal_hold`, and when the ACH file goes out, the aggregate credit represents those funds leaving Hudson.
+
+---
+
+### **Fees and Internal Transactions**
+
+**Fee swipes:** When Hudson charges a transaction fee, the fee amount moves from the client account to the BetrLink Fee Hold account. This is an internal transaction — no ACH, no aggregate, no change to the corporate master balance. It simply reallocates whose slice of the corporate master belongs to whom. When BetrLink is ready to pay itself, a withdrawal ACH Out Credit file is generated, and that file creates an aggregate credit and moves the money out of the corporate master into BetrLink's operating account.
+
+**Direct pay:** Creditors with accounts in Hudson (for example, Cavalry, Synchrony) receive payments via internal transactions. The client's account balance decreases and the creditor's payee account balance increases. No aggregate is created for this step. Once per day, all accumulated funds in the creditor's payee account are swept via a single ACH Out Credit, which does create an aggregate. The creditor receives a separate file (a remittance or settlement file) explaining how to allocate the lump sum across individual clients.
+
+Direct pay payments are free to the client.
+
+---
+
+### **Transaction Statuses**
+
+Every transaction moves through a defined set of statuses:
+
+**Pending:** Initial state. The transaction exists in the system but the money has not moved. A null `cleared_date` confirms this.
+
+**Cleared:** The money moved. The `cleared_date` is populated.
+
+**Voided:** The transaction was canceled before clearing. The money never moved and never will. No related transaction is created.
+
+**Returned:** Applies only to deposits. A return notice was received before the deposit cleared. The money never reached the client account.
+
+**Reversed:** The transaction had cleared, and a subsequent return or manual reversal undid the movement. A related reversal transaction (RD for deposits, RP for payments) must exist and must itself clear to actually move the money back. Marking a transaction Reversed without the companion transaction does nothing to the ledger.
+
+---
+
+### **Transaction Classes and Types**
+
+Transactions are categorized by two fields:
+
+**Class** describes the direction of movement: D (Deposit), W (Withdrawal), P (Payment), and so on.
+
+**Type** describes the method or sub-type: A (ACH), C (Check), F (courtesy credit / direct from fee account), etc. Combined, class and type identify the exact nature and expected path of a transaction.
+
+Aggregate transactions use the types DA (aggregate debit, money in) and CA (aggregate credit, money out). These reversed labels are one of the known counterintuitive aspects of the system: a "debit" aggregate represents money coming into BetrLink, because BetrLink is debiting the external world.
+
+---
+
+### **The Daily Clear Job**
+
+The clear job runs daily and processes transactions in a defined order. The order exists to ensure that money is available before it is moved and that client-critical payments take priority over fees.
+
+**1\. Move money in:** Clear aggregate debits. Money from ACH Out Debit files moves from the external world into hold accounts (`deposit_hold`, `payment_withdrawal_hold`).
+
+**2\. Fund client accounts:** Clear client deposits and courtesy credits. Money moves from `deposit_hold` into client accounts after the 3-day hold window.
+
+**3\. Process reversals:** Clear deposit reversals (RD) and payment reversals (RP). These are obligations already incurred. The money is already gone and must be reclaimed first.
+
+**4\. Pay creditors:** Clear client payments, moving funds from client accounts to `payment_withdrawal_hold`.
+
+**5\. Process withdrawals:** Clear client withdrawal requests.
+
+**6\. Collect fees:** Clear settlement fees (DSC fees), then BetrLink transaction fees.
+
+**7\. Move money out:** Clear aggregate credits. Money leaves Hudson via ACH Out Credit files for payments, withdrawals, and fee distributions.
+
+If a client does not have sufficient funds for a scheduled payment or fee, the transaction remains in Pending status. Hudson does not overdraft clients. The transaction will clear automatically when funds become available (e.g., after the next deposit clears). Transactions that are abandoned are Voided, typically within approximately one week.
+
+---
+
+### **Multi-Bank Architecture**
+
+Hudson processes transactions through two physical bank accounts: one at Century Next Bank (CNext) and one at Benchmark Bank (BNB). This dual-bank structure exists primarily to manage compliance limits at CNext and to mitigate concentration risk.
+
+Each DSC client is assigned a processing bank at enrollment, determined by a probability setting in Salesforce. All of that client's transactions, deposits, withdrawals, payments, flow through their assigned bank. The assignment does not change after enrollment.
+
+When a transaction clears that involves accounts assigned to different banks (for example, a creditor payment where the client is at BNB but the creditor's account is at CNext), a Bank Transfer Line is created in the system to track the cross-bank movement. At the end of each day, all Bank Transfer Lines are netted, and a single inter-bank ACH moves the net amount between CNext and BNB.
+
+**Known issue with REACH funding:** REACH funds arrive at CNext via an ACHN file regardless of which bank the receiving client is assigned to. If the client is assigned to BNB, the system incorrectly attempts to move the funds from BNB's deposit hold rather than CNext's. This mismatch requires a manual inter-bank transfer to correct the balances. This is an open engineering issue.
+
+---
+
+### **Funds in Transit**
+
+Funds in Transit is BetrLink's mechanism for earning interest on cleared payments that have not yet been collected by a creditor.
+
+Once a payment clears (money moves from client account to `payment_withdrawal_hold`) and is available to the creditor, those funds are no longer the client's. Until the creditor collects, BetrLink is allowed to hold them in an interest-bearing account at Century Next. The balance of this account is adjusted daily to match the total value of all cleared-but-uncashed payments in the system.
+
+This is one of BetrLink's revenue streams. The interest accrues between the `cleared_date` and the `posted_date` on each payment.
+
+---
+
+### **REACH Funding**
+
+REACH is a third-party lender (separate from NDR, though with overlapping leadership) that extends loans to DSC clients to help them complete their programs faster. Where a client's normal deposit timeline might span three years, a REACH loan can bridge the gap and compress the program to six months or less.
+
+REACH funding arrives at BetrLink via an ACHN file — money coming into BetrLink, initiated by REACH. This is the only scenario in which BetrLink creates a new deposit transaction (a DB-type transaction) in response to an incoming ACHN. In all other cases, ACHN lines are matched against existing cleared payment transactions; BetrLink does not create new transactions based on incoming ACH. REACH is the exception.
+
+Hudson processes millions of dollars in REACH funding per month.
+
