@@ -50,7 +50,7 @@
           "platform/configuration/settings",
           "platform/configuration/user-management",
           "platform/administration/roles-permissions",
-          "platform/lorem-ipsum.mdx"
+          "platform/lorem-ipsum"
         ]
       },
       {
