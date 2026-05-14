@@ -51,7 +51,8 @@
           "platform/configuration/user-management",
           "platform/administration/roles-permissions",
           "platform/lorem-ipsum",
-          "lorem-ipsum"
+          "lorem-ipsum",
+          "testing123"
         ]
       },
       {
