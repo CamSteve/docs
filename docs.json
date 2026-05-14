@@ -39,7 +39,7 @@
       ]
     },
     "directory": "card",
-    "groups": [
+    "pages": [
       {
         "group": "Platform",
         "icon": "layers",
@@ -74,7 +74,8 @@
           "integrations/connectors/crm",
           "integrations/webhooks/configure"
         ]
-      }
+      },
+      "lorem-ipsum"
     ]
   },
   "logo": {
